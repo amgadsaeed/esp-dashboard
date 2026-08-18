@@ -1212,12 +1212,6 @@ def build_whatsapp_message(summary, report_date):
             msg.append(f"   • {row['Well']}: +{row['Net Rise (psi)']} psi")
     else:
         msg.append("\nRising PIP Trends: None flagged")
-
-    # Footer
-    msg.extend([
-        "----------------------------------------",
-        "_Dashboard PNG, Detail Excel Workbook, and text log attached below._"
-    ])
     
     return "\n".join(msg)
 
