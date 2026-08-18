@@ -1178,7 +1178,7 @@ def build_whatsapp_message(summary, report_date):
         wells_str = ", ".join(map(str, stopped_wells))
         msg.append(f"\n*Stopped Wells* ({stopped}): {wells_str}")
     else:
-        msg.append("\nStopped Wells: None recorded")
+        msg.append("\n*Stopped Wells:* None recorded")
 
     # Miscommunication Wells Detailed Section
     if miscomm > 0:
