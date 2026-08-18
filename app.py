@@ -166,6 +166,10 @@ if st.session_state.stage in ("review", "done") and st.session_state.summary is 
         shutdown_df = shutdown_df.reindex(columns=shutdown_cols)
     else:
         shutdown_df = pd.DataFrame(columns=shutdown_cols)
+    st.caption(
+        "**Downtime (hrs) is calculated automatically** from Shutdown Start/End "
+        "and can't be typed in directly \u2014 edit the Start/End times instead."
+    )
     edited_shutdown = st.data_editor(
         shutdown_df,
         num_rows="dynamic",
@@ -174,10 +178,21 @@ if st.session_state.stage in ("review", "done") and st.session_state.summary is 
         column_config={
             "Shutdown Start": st.column_config.DatetimeColumn(),
             "Shutdown End": st.column_config.DatetimeColumn(),
-            "Downtime (hrs)": st.column_config.NumberColumn(step=0.01),
+            "Downtime (hrs)": st.column_config.NumberColumn(
+                disabled=True, help="Auto-calculated from Shutdown Start/End."
+            ),
             "Ongoing": st.column_config.CheckboxColumn(),
         },
     )
+    # Always recompute Downtime from Start/End, overriding any stale or
+    # manually-typed value - this runs on every rerun (i.e. every edit),
+    # so the disabled column above reflects the latest Start/End on the
+    # very next interaction.
+    _start_ts = pd.to_datetime(edited_shutdown["Shutdown Start"], errors="coerce")
+    _end_ts = pd.to_datetime(edited_shutdown["Shutdown End"], errors="coerce")
+    edited_shutdown["Downtime (hrs)"] = (
+        (_end_ts - _start_ts).dt.total_seconds() / 3600.0
+    ).round(2)
 
     # ---- High vibration alerts (editable: delete rows only, matches notebook) ----
     st.subheader(f"High Vibration Alerts (Vx > {dl.VX_THRESHOLD_G}G)")
@@ -213,7 +228,11 @@ if st.session_state.stage in ("review", "done") and st.session_state.summary is 
         # same logic as the notebook's review_shutdown_table().
         df = edited_shutdown.copy()
         if not df.empty:
-            df["Downtime (hrs)"] = pd.to_numeric(df["Downtime (hrs)"], errors="coerce")
+            # Downtime is already auto-calculated from Start/End above; a
+            # missing End (still ongoing / unknown) leaves it as NaN rather
+            # than a manually-typed guess - treat that as 0.0 for sorting
+            # and the chart/export, same fallback the notebook used.
+            df["Downtime (hrs)"] = pd.to_numeric(df["Downtime (hrs)"], errors="coerce").fillna(0.0)
             df = df.sort_values("Downtime (hrs)", ascending=False).reset_index(drop=True)
             shutdown_count_df = (
                 df.groupby("Well").size().reset_index(name="Shutdown Count")

@@ -949,7 +949,7 @@ def draw_reason_pie(fig, gs_cell, reason_counts, max_slices=8):
 
     wedges, _, autotexts = ax.pie(
         counts.values, colors=colors, autopct=lambda p: f'{p:.0f}%' if p >= 4 else '',
-        startangle=90, pctdistance=0.6, radius=0.95,
+        startangle=90, pctdistance=0.78, radius=0.95,
         wedgeprops=dict(edgecolor='white', linewidth=1.5),
         textprops=dict(color='white', fontweight='bold', fontsize=10.5),
     )
