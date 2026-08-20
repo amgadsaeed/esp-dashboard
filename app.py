@@ -3,11 +3,14 @@ ESP Field Dashboard - Streamlit web app.
 
 Team workflow:
   1. Upload the two ZIPs (All-wells snapshot + Single-wells time series).
-  2. Review/edit the auto-detected Shutdown Events, Vibration, and PIP
-     tables right in the browser (replaces the notebook's input() prompts).
-  3. Build outputs -> desktop PNG, mobile/WhatsApp PNG, Excel workbook,
+  2. Review/adjust every detection threshold (all optional, defaults match
+     the original notebook).
+  3. Review/edit the auto-detected Shutdown Events, Vibration, PIP, and
+     Motor Temp tables right in the browser (replaces the notebook's
+     input() prompts).
+  4. Build outputs -> desktop PNG, mobile/WhatsApp PNG, Excel workbook,
      WhatsApp message text.
-  4. Optionally push the generated report to a GitHub repo, so every run
+  5. Optionally push the generated report to a GitHub repo, so every run
      is saved with full history (who ran it, when, and what changed).
 """
 import io
@@ -94,9 +97,69 @@ fallback_total = st.number_input(
     help="Leave at 0 to just use the number of well files found.",
 )
 
+# ==================================================================
+# STEP 2 - DETECTION THRESHOLDS (all limits/constraints, editable)
+# ==================================================================
+st.header("2. Detection thresholds")
+st.caption(
+    "These control what counts as an alert. Defaults match the original notebook \u2014 "
+    "change any value below before processing if you want different sensitivity."
+)
+
+# (attr on dashboard_lib, label, min_value, step, is_a_time_window_in_minutes, help text)
+THRESHOLD_SPEC = [
+    ("VX_THRESHOLD_G", "High vibration alert threshold (G)", 0.0, 0.1, False,
+     "Any single Vx reading above this is flagged as a vibration alert."),
+    ("VX_GLITCH_CHECK_G", "Vibration glitch-check threshold (G)", 0.0, 0.1, False,
+     "Spikes at/above this need a shutdown nearby to count as real, not sensor noise."),
+    ("VX_GLITCH_WINDOW_BACK", "Glitch tolerance window \u2014 before spike (min)", 0.0, 1.0, True,
+     "How far back a shutdown can start and still explain a high-Vx spike."),
+    ("VX_GLITCH_WINDOW_FWD", "Glitch tolerance window \u2014 after spike (min)", 0.0, 5.0, True,
+     "How far forward a shutdown can start and still explain a high-Vx spike."),
+    ("VX_DOUBLE_RATIO", "Vibration doubling ratio", 1.0, 0.1, False,
+     "Flag a well if its settled Vx is at least this many times its baseline Vx."),
+    ("VX_DOUBLE_MIN_BASELINE_G", "Min. baseline Vx to check doubling (G)", 0.0, 0.01, False,
+     "Avoids flagging near-zero baseline noise as a 'doubling'."),
+    ("VX_DOUBLE_BASELINE_WINDOW", "Vibration baseline/7AM window (min)", 5.0, 5.0, True,
+     "Window used to compute the starting and 7 AM Vx levels for the doubling check."),
+    ("PIP_RISE_THRESHOLD_PSI", "Sustained PIP rise threshold (psi)", 0.0, 1.0, False,
+     "Minimum sustained PIP increase (baseline to 7 AM) to flag a rising-PIP trend."),
+    ("PIP_BASELINE_WINDOW", "PIP baseline/7AM window (min)", 5.0, 5.0, True,
+     "Window used to compute the starting and 7 AM PIP levels."),
+    ("TEMP_RISE_THRESHOLD_F", "Sustained motor-temp rise threshold (\u00b0F)", 0.0, 0.5, False,
+     "Minimum sustained motor-temp increase (baseline to 7 AM) to flag a well."),
+    ("TEMP_BASELINE_WINDOW", "Motor-temp baseline/7AM window (min)", 5.0, 5.0, True,
+     "Window used to compute the starting and 7 AM motor-temp levels."),
+    ("IMPLAUSIBLE_TEMP_F", "Implausible temperature floor (\u00b0F)", 0.0, 1.0, False,
+     "Temp readings below this are treated as a sensor/comm glitch, not a real reading."),
+]
+
+
+def _default_for(attr_name):
+    val = getattr(dl, attr_name)
+    return val.total_seconds() / 60.0 if isinstance(val, pd.Timedelta) else float(val)
+
+
+threshold_values = {}
+with st.expander("Adjust thresholds", expanded=True):
+    t_cols = st.columns(2)
+    for i, (attr, label, min_val, step, is_minutes, help_text) in enumerate(THRESHOLD_SPEC):
+        with t_cols[i % 2]:
+            threshold_values[attr] = st.number_input(
+                label, min_value=min_val, value=_default_for(attr), step=step,
+                help=help_text, key=f"threshold_{attr}",
+            )
+
 process_clicked = st.button("Process data", type="primary", disabled=not (all_wells_zip or single_wells_zip))
 
 if process_clicked:
+    # Apply the (possibly edited) thresholds to dashboard_lib before running
+    # any detection - every detector reads these as plain module globals,
+    # so setting them here affects this run's process_folder()/build_summary().
+    for attr, label, min_val, step, is_minutes, help_text in THRESHOLD_SPEC:
+        val = threshold_values[attr]
+        setattr(dl, attr, pd.Timedelta(minutes=val) if is_minutes else val)
+
     tmp_root = tempfile.mkdtemp(prefix="esp_dash_")
     try:
         all_wells_path = None
@@ -142,16 +205,17 @@ if process_clicked:
                 f"Miscommunication: {summary['miscommunication']} | "
                 f"Shutdown events: {len(summary['shutdown_df'])} | "
                 f"Vx > {dl.VX_THRESHOLD_G}G wells: {len(summary['vx_df'])} | "
-                f"Rising PIP wells: {len(summary['pip_df'])}"
+                f"Rising PIP wells: {len(summary['pip_df'])} | "
+                f"Motor temp rise wells: {len(summary['temp_df'])}"
             )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 # ==================================================================
-# STEP 2 - REVIEW / EDIT TABLES
+# STEP 3 - REVIEW / EDIT TABLES
 # ==================================================================
 if st.session_state.stage in ("review", "done") and st.session_state.summary is not None:
-    st.header("2. Review / edit tables")
+    st.header("3. Review / edit tables")
     st.caption(
         "Add, edit, or delete rows below \u2014 mirrors the notebook's REVIEW / EDIT TABLES step. "
         "Nothing is finalized until you click 'Build outputs' below."
@@ -220,6 +284,19 @@ if st.session_state.stage in ("review", "done") and st.session_state.summary is 
         )
         edited_pip = edited_pip_raw[edited_pip_raw["Keep"]].drop(columns=["Keep"]).reset_index(drop=True)
 
+    # ---- Sustained motor temp increase (editable: delete rows only) ----
+    st.subheader(f"Sustained Motor Temp Increase (> {dl.TEMP_RISE_THRESHOLD_F}\u00b0F, still up at 7AM)")
+    temp_df = summary["temp_df"].copy().reset_index(drop=True)
+    if temp_df.empty:
+        st.caption("No wells showed a sustained motor-temp rise.")
+        edited_temp = temp_df
+    else:
+        temp_df.insert(0, "Keep", True)
+        edited_temp_raw = st.data_editor(
+            temp_df, use_container_width=True, key="temp_editor", disabled=[c for c in temp_df.columns if c != "Keep"]
+        )
+        edited_temp = edited_temp_raw[edited_temp_raw["Keep"]].drop(columns=["Keep"]).reset_index(drop=True)
+
     st.divider()
     build_clicked = st.button("Build outputs", type="primary")
 
@@ -248,14 +325,15 @@ if st.session_state.stage in ("review", "done") and st.session_state.summary is 
         summary["reason_counts"] = reason_counts
         summary["vx_df"] = edited_vx.sort_values("Max Vx (G)", ascending=False).reset_index(drop=True) if not edited_vx.empty else edited_vx
         summary["pip_df"] = edited_pip.sort_values("Net Rise (psi)", ascending=False).reset_index(drop=True) if not edited_pip.empty else edited_pip
+        summary["temp_df"] = edited_temp.sort_values("Rise (F)", ascending=False).reset_index(drop=True) if not edited_temp.empty else edited_temp
         st.session_state.summary = summary
         st.session_state.stage = "done"
 
 # ==================================================================
-# STEP 3 - OUTPUTS
+# STEP 4 - OUTPUTS
 # ==================================================================
 if st.session_state.stage == "done" and st.session_state.summary is not None:
-    st.header("3. Report")
+    st.header("4. Report")
     summary = st.session_state.summary
     results = st.session_state.results
     report_date = st.session_state.report_date
