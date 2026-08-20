@@ -43,6 +43,8 @@ VX_GLITCH_WINDOW_FWD = pd.Timedelta(hours=2)       # how long after the spike a 
 PIP_RISE_THRESHOLD_PSI = 15   # sustained PIP increasing-trend threshold
 IMPLAUSIBLE_TEMP_F = 50.0     # downhole temp reading below this = comm/scan glitch, not real
 PIP_BASELINE_WINDOW = pd.Timedelta(minutes=60)  # window used to establish start/end PIP levels
+TEMP_RISE_THRESHOLD_F = 5.0      # sustained motor-temp increasing-trend threshold
+TEMP_BASELINE_WINDOW = pd.Timedelta(minutes=60)  # window used to establish start/end motor-temp levels
 VX_ACTIVE_THRESHOLD_G = 0.1   # fallback: Vx must be CHANGING and exceed this to count as active
 VX_DOUBLE_RATIO = 2.0           # flag if current Vx is >= 2x its baseline
 VX_DOUBLE_MIN_BASELINE_G = 0.05 # baseline must be at least this to avoid dividing by near-zero noise
@@ -583,6 +585,58 @@ def find_pip_trend(df, well_name):
     }
 
 
+def find_motor_temp_rise(df, well_name):
+    """
+    Rising motor-temperature detector, same sustained-trend approach as
+    find_pip_trend so a momentary spike doesn't get mistaken for a real
+    increase:
+      - Implausible readings (< IMPLAUSIBLE_TEMP_F, a comm/scan glitch) are
+        dropped.
+      - Rows logged while the pump is OFF are dropped too, so a temp change
+        during a shutdown isn't counted as a genuine running-motor trend.
+      - The rise is measured as a SUSTAINED shift: the median motor temp
+        over the first TEMP_BASELINE_WINDOW of the day (baseline) vs. the
+        median over the last TEMP_BASELINE_WINDOW (current level, i.e. at
+        7 AM). Only flagged if that sustained rise exceeds
+        TEMP_RISE_THRESHOLD_F - a brief spike that settles back down washes
+        out of the final-window median and is correctly ignored.
+    """
+    if COL_STATUS_MOTOR in df.columns:
+        running_mask = df[COL_STATUS_MOTOR].ffill() != 'Stopped'
+    else:
+        running_mask = pd.Series(True, index=df.index)
+
+    temp_raw = get_col(df, COL_TEMP_MOTOR)
+    valid_mask = temp_raw.notna() & (temp_raw >= IMPLAUSIBLE_TEMP_F) & running_mask
+    temp = temp_raw[valid_mask]
+    ts = df.loc[temp.index, COL_TIMESTAMP]
+
+    if len(temp) < 4:
+        return None
+
+    baseline_mask = ts <= (ts.iloc[0] + TEMP_BASELINE_WINDOW)
+    final_mask = ts >= (ts.iloc[-1] - TEMP_BASELINE_WINDOW)
+
+    baseline = temp[baseline_mask].median()
+    current_level = temp[final_mask].median()
+    sustained_rise = current_level - baseline
+
+    if pd.isna(sustained_rise) or sustained_rise <= TEMP_RISE_THRESHOLD_F:
+        return None
+
+    peak_val = temp.max()
+    peak_idx = temp.idxmax()
+
+    return {
+        'Well': well_name,
+        'Baseline Temp (F)': round(float(baseline), 1),
+        'Current Temp (F)': round(float(current_level), 1),
+        'Rise (F)': round(float(sustained_rise), 1),
+        'Peak Temp (F)': round(float(peak_val), 1),
+        'Peak Time': df.loc[peak_idx, COL_TIMESTAMP],
+    }
+
+
 def process_well_file(filepath):
     well_name = extract_well_name(filepath)
     try:
@@ -590,13 +644,13 @@ def process_well_file(filepath):
     except Exception as e:
         return {
             'well_name': well_name, 'filepath': filepath, 'error': str(e),
-            'status': 'No Data', 'shutdown_events': [], 'vx_alert': None, 'pip_trend': None,
+            'status': 'No Data', 'shutdown_events': [], 'vx_alert': None, 'pip_trend': None, 'temp_rise': None,
         }
 
     if df.empty:
         return {
             'well_name': well_name, 'filepath': filepath, 'error': 'empty file',
-            'status': 'No Data', 'shutdown_events': [], 'vx_alert': None, 'pip_trend': None,
+            'status': 'No Data', 'shutdown_events': [], 'vx_alert': None, 'pip_trend': None, 'temp_rise': None,
         }
 
     file_end_time = df[COL_TIMESTAMP].max()
@@ -605,6 +659,7 @@ def process_well_file(filepath):
     shutdown_starts = [e['Shutdown Start'] for e in shutdown_events]
     vx_alert = find_vx_alerts(df, well_name, shutdown_starts)
     pip_trend = find_pip_trend(df, well_name)
+    temp_rise = find_motor_temp_rise(df, well_name)
 
     return {
         'well_name': well_name,
@@ -616,6 +671,7 @@ def process_well_file(filepath):
         'shutdown_events': shutdown_events,
         'vx_alert': vx_alert,
         'pip_trend': pip_trend,
+        'temp_rise': temp_rise,
         'n_rows': len(df),
         'date_range': (df[COL_TIMESTAMP].min(), df[COL_TIMESTAMP].max()),
     }
@@ -738,6 +794,14 @@ def build_summary(results, total_wells_expected=None, miscommunication_wells=Non
     if not pip_df.empty:
         pip_df = pip_df.sort_values('Net Rise (psi)', ascending=False).reset_index(drop=True)
 
+    # Only surface a sustained motor-temp rise for wells that had NO
+    # shutdown events during the period, same rationale as the PIP trend
+    # above - a shutdown better explains a temp change than a real issue.
+    temp_rows = [r['temp_rise'] for r in results if r['temp_rise'] and not r['shutdown_events']]
+    temp_df = pd.DataFrame(temp_rows)
+    if not temp_df.empty:
+        temp_df = temp_df.sort_values('Rise (F)', ascending=False).reset_index(drop=True)
+
     # shutdown count per well (for the bar chart)
     if not shutdown_df.empty:
         shutdown_count_df = (
@@ -785,7 +849,7 @@ def build_summary(results, total_wells_expected=None, miscommunication_wells=Non
         'running': running, 'stopped': stopped, 'stopped_wells': stopped_wells,
         'no_data': no_data, 'no_data_wells': no_data_wells,
         'well_status_df': well_status_df,
-        'shutdown_df': shutdown_df, 'vx_df': vx_df, 'pip_df': pip_df,
+        'shutdown_df': shutdown_df, 'vx_df': vx_df, 'pip_df': pip_df, 'temp_df': temp_df,
         'shutdown_count_df': shutdown_count_df, 'reason_counts': reason_counts,
     }
 
@@ -965,6 +1029,62 @@ def draw_shutdown_count_bar(fig, gs_cell, shutdown_count_df, max_wells=15):
                        fontsize=10.5, color=SLATE, style='italic', transform=outer_ax.transAxes)
 
 
+def draw_motor_temp_bar(fig, gs_cell, temp_df, max_wells=15):
+    """
+    Stacked horizontal bar per well: the baseline (usual/normal) motor
+    temperature in a neutral shade, with the sustained increase on top of
+    it in a distinct warm color, so the "extra" portion driving the alert
+    is visually separated from the well's normal operating temperature.
+    """
+    outer_ax = fig.add_subplot(gs_cell)
+    outer_ax.axis('off')
+    outer_ax.set_title(
+        f'Sustained Motor Temp Increase (> {TEMP_RISE_THRESHOLD_F}\u00b0F, still up at 7AM)',
+        fontsize=16, fontweight='bold', color=DARK_GREEN, pad=10, loc='left',
+    )
+
+    if temp_df is None or temp_df.empty:
+        outer_ax.text(0.02, 0.5, f'No wells showed a sustained motor-temp rise greater than {TEMP_RISE_THRESHOLD_F}\u00b0F.',
+                       fontsize=13, color=SLATE, transform=outer_ax.transAxes)
+        return
+
+    shown = temp_df.head(max_wells).iloc[::-1]
+
+    gs_inner = gs_cell.subgridspec(1, 2, width_ratios=[0.22, 0.78])
+    ax = fig.add_subplot(gs_inner[0, 1])
+    ax.set_facecolor(BG_PANEL)
+    for spine in ['top', 'right']:
+        ax.spines[spine].set_visible(False)
+    for spine in ['left', 'bottom']:
+        ax.spines[spine].set_color(GRID)
+    ax.tick_params(colors=SLATE, labelsize=11)
+    ax.set_axisbelow(True)
+    ax.grid(axis='x', color=GRID, linewidth=0.8, zorder=0)
+    ax.grid(axis='y', visible=False)
+
+    wells = shown['Well'].astype(str)
+    baseline = shown['Baseline Temp (F)']
+    rise = shown['Rise (F)']
+
+    # Normal/usual portion (baseline temp) vs. the increase, in a clearly
+    # different color from the "normal" shade used everywhere else on the
+    # dashboard.
+    ax.barh(wells, baseline, color=SLATE, alpha=0.35, zorder=3, edgecolor='white', linewidth=1, label='Baseline (normal) temp')
+    ax.barh(wells, rise, left=baseline, color=RED, zorder=3, edgecolor='white', linewidth=1, label='Sustained increase')
+
+    for i, (b, r) in enumerate(zip(baseline.values, rise.values)):
+        ax.text(b + r + max(baseline + rise) * 0.015, i, f'+{r:.1f}\u00b0F', va='center',
+                fontweight='bold', fontsize=11.5, color=RED)
+
+    ax.set_xlim(0, (baseline + rise).max() * 1.18)
+    ax.set_xlabel('Motor Temperature (\u00b0F)', fontsize=12, color=SLATE)
+    ax.legend(loc='lower right', fontsize=10, frameon=False, labelcolor=SLATE)
+
+    if len(temp_df) > max_wells:
+        outer_ax.text(0.02, -0.06, f'+ {len(temp_df) - max_wells} more wells \u2014 see detail workbook',
+                       fontsize=10.5, color=SLATE, style='italic', transform=outer_ax.transAxes)
+
+
 def draw_reason_pie(fig, gs_cell, reason_counts, max_slices=8):
     ax = fig.add_subplot(gs_cell)
     ax.axis('off')
@@ -1033,6 +1153,7 @@ def compute_row_height_ratios(summary):
     n_bar = min(len(summary['shutdown_count_df']), 15) if not summary['shutdown_count_df'].empty else 0
     n_vx = min(len(summary['vx_df']), 12) if not summary['vx_df'].empty else 0
     n_pip = min(len(summary['pip_df']), 12) if not summary['pip_df'].empty else 0
+    n_temp = min(len(summary['temp_df']), 15) if not summary['temp_df'].empty else 0
     n_detail = max(n_vx, n_pip)
 
     # Extra room under the KPI row for each stacked highlight note (stopped
@@ -1047,7 +1168,8 @@ def compute_row_height_ratios(summary):
     ratio_shutdown = min(1.35, max(0.35, 0.30 + 0.0525 * n_sd))
     ratio_bar_pie = min(1.00, max(0.55, 0.50 + 0.0333 * n_bar))
     ratio_detail = min(1.05, max(0.40, 0.30 + 0.0625 * n_detail))
-    return [ratio_kpi, ratio_shutdown, ratio_bar_pie, ratio_detail]
+    ratio_temp = min(1.00, max(0.35, 0.30 + 0.0333 * n_temp))
+    return [ratio_kpi, ratio_shutdown, ratio_bar_pie, ratio_detail, ratio_temp]
 
 
 # Constants tuned so a "full" report (20/15/12 rows) reproduces the original,
@@ -1096,7 +1218,7 @@ def build_dashboard_figure(summary, report_date, output_png):
 
     fig = plt.figure(figsize=(19, fig_height), facecolor='white')
 
-    gs = fig.add_gridspec(4, 2, height_ratios=height_ratios, hspace=0.45, wspace=0.18,
+    gs = fig.add_gridspec(5, 2, height_ratios=height_ratios, hspace=0.45, wspace=0.18,
                            left=0.14, right=0.86, top=GRIDSPEC_TOP, bottom=GRIDSPEC_BOTTOM)
 
     draw_section_dividers(fig, gs)
@@ -1143,6 +1265,8 @@ def build_dashboard_figure(summary, report_date, output_png):
     fig.text(0.08, 0.03, f'Generated {datetime.now().strftime("%d-%b-%Y %H:%M")}  \u2022  Generated by ProductionLink Team at TAM OIL',
               fontsize=11, color=SLATE, ha='left', style='italic')
 
+    draw_motor_temp_bar(fig, gs[4, :], summary['temp_df'])
+
     plt.savefig(output_png, dpi=150, facecolor='white', bbox_inches='tight')
     plt.close(fig)
 
@@ -1161,6 +1285,9 @@ def export_excel(summary, results, output_xlsx):
             columns=['Well', 'PIP-Yesterday 7AM (psi)', 'PIP-Today 7AM (psi)', 'Net Rise (psi)',
                      'Peak PIP (psi)', 'Peak Time']
         )).to_excel(writer, sheet_name='PIP Rising Trend', index=False)
+        (summary['temp_df'] if not summary['temp_df'].empty else pd.DataFrame(
+            columns=['Well', 'Baseline Temp (F)', 'Current Temp (F)', 'Rise (F)', 'Peak Temp (F)', 'Peak Time']
+        )).to_excel(writer, sheet_name='Motor Temp Rising Trend', index=False)
         (summary['shutdown_count_df'] if not summary['shutdown_count_df'].empty else pd.DataFrame(
             columns=['Well', 'Shutdown Count']
         )).to_excel(writer, sheet_name='Shutdown Count per Well', index=False)
@@ -1195,6 +1322,7 @@ def build_whatsapp_message(summary, report_date):
     shutdown_df = summary['shutdown_df']
     vx_df = summary['vx_df']
     pip_df = summary['pip_df']
+    temp_df = summary['temp_df']
     
     stopped_wells = summary.get('stopped_wells', [])
     miscomm_wells = summary.get('miscommunication_wells', [])
@@ -1252,6 +1380,14 @@ def build_whatsapp_message(summary, report_date):
             msg.append(f"   • {row['Well']}: +{row['Net Rise (psi)']} psi")
     else:
         msg.append("\nRising PIP Trends: None flagged")
+
+    # Rising Motor Temp Section
+    if not temp_df.empty:
+        msg.append(f"\n*Sustained Motor Temp Increase* > {TEMP_RISE_THRESHOLD_F}\u00b0F, still up at 7AM ({len(temp_df)} wells):")
+        for _, row in temp_df.head(5).iterrows():
+            msg.append(f"   • {row['Well']}: +{row['Rise (F)']}\u00b0F (now {row['Current Temp (F)']}\u00b0F)")
+    else:
+        msg.append(f"\nSustained Motor Temp Increase: None > {TEMP_RISE_THRESHOLD_F}\u00b0F")
 
     # Footer
     msg.extend([
@@ -1462,6 +1598,53 @@ def draw_shutdown_count_bar_mobile(fig, gs_cell, shutdown_count_df, max_wells=15
                        fontsize=12, color=SLATE, style='italic', transform=outer_ax.transAxes)
 
 
+def draw_motor_temp_bar_mobile(fig, gs_cell, temp_df, max_wells=15):
+    outer_ax = fig.add_subplot(gs_cell)
+    outer_ax.axis('off')
+    outer_ax.set_title(
+        f'Motor Temp Increase (> {TEMP_RISE_THRESHOLD_F}\u00b0F, still up at 7AM)',
+        fontsize=19, fontweight='bold', color=DARK_GREEN, pad=14, loc='left',
+    )
+
+    if temp_df is None or temp_df.empty:
+        outer_ax.text(0.02, 0.5, f'No wells showed a sustained motor-temp rise greater than {TEMP_RISE_THRESHOLD_F}\u00b0F.',
+                       fontsize=15, color=SLATE, transform=outer_ax.transAxes)
+        return
+
+    shown = temp_df.head(max_wells).iloc[::-1]
+
+    gs_inner = gs_cell.subgridspec(1, 2, width_ratios=[0.28, 0.72])
+    ax = fig.add_subplot(gs_inner[0, 1])
+    ax.set_facecolor(BG_PANEL)
+    for spine in ['top', 'right']:
+        ax.spines[spine].set_visible(False)
+    for spine in ['left', 'bottom']:
+        ax.spines[spine].set_color(GRID)
+    ax.tick_params(colors=SLATE, labelsize=13)
+    ax.set_axisbelow(True)
+    ax.grid(axis='x', color=GRID, linewidth=0.8, zorder=0)
+    ax.grid(axis='y', visible=False)
+
+    wells = shown['Well'].astype(str)
+    baseline = shown['Baseline Temp (F)']
+    rise = shown['Rise (F)']
+
+    ax.barh(wells, baseline, color=SLATE, alpha=0.35, zorder=3, edgecolor='white', linewidth=1, label='Baseline (normal)')
+    ax.barh(wells, rise, left=baseline, color=RED, zorder=3, edgecolor='white', linewidth=1, label='Increase')
+
+    for i, (b, r) in enumerate(zip(baseline.values, rise.values)):
+        ax.text(b + r + max(baseline + rise) * 0.015, i, f'+{r:.1f}\u00b0F', va='center',
+                fontweight='bold', fontsize=14, color=RED)
+
+    ax.set_xlim(0, (baseline + rise).max() * 1.18)
+    ax.set_xlabel('Motor Temperature (\u00b0F)', fontsize=14, color=SLATE)
+    ax.legend(loc='lower right', fontsize=12, frameon=False, labelcolor=SLATE)
+
+    if len(temp_df) > max_wells:
+        outer_ax.text(0.02, -0.06, f'+ {len(temp_df) - max_wells} more wells \u2014 see detail workbook',
+                       fontsize=12, color=SLATE, style='italic', transform=outer_ax.transAxes)
+
+
 def draw_reason_pie_mobile(fig, gs_cell, reason_counts, max_slices=8):
     # Title gets its own thin row (rather than sharing the pie's axes), with
     # a real gap (hspace) before the pie row below it - this both keeps the
@@ -1518,6 +1701,7 @@ def compute_row_height_ratios_mobile(summary):
     n_vx = min(len(summary['vx_df']), 12) if not summary['vx_df'].empty else 0
     n_pip = min(len(summary['pip_df']), 12) if not summary['pip_df'].empty else 0
     n_pie = min(len(summary['reason_counts']), 8) if len(summary['reason_counts']) else 0
+    n_temp = min(len(summary['temp_df']), 15) if not summary['temp_df'].empty else 0
 
     note_lines = (
         (1 if summary.get('stopped', 0) > 0 else 0)
@@ -1530,7 +1714,8 @@ def compute_row_height_ratios_mobile(summary):
     ratio_pie = min(1.05, max(0.52, 0.30 + 0.068 * n_pie))
     ratio_vx = min(1.05, max(0.32, 0.19 + 0.068 * n_vx))
     ratio_pip = min(1.05, max(0.32, 0.19 + 0.068 * n_pip))
-    return [ratio_kpi, ratio_shutdown, ratio_bar, ratio_pie, ratio_vx, ratio_pip]
+    ratio_temp = min(1.05, max(0.32, 0.19 + 0.052 * n_temp))
+    return [ratio_kpi, ratio_shutdown, ratio_bar, ratio_pie, ratio_vx, ratio_pip, ratio_temp]
 
 
 def build_mobile_dashboard_figure(summary, report_date, output_png):
@@ -1542,7 +1727,7 @@ def build_mobile_dashboard_figure(summary, report_date, output_png):
     fig_height = max(MOBILE_MIN_HEIGHT_IN, gridspec_in / (MOBILE_TOP - MOBILE_BOTTOM))
 
     fig = plt.figure(figsize=(MOBILE_FIG_WIDTH_IN, fig_height), facecolor='white')
-    gs = fig.add_gridspec(6, 1, height_ratios=height_ratios, hspace=0.60,
+    gs = fig.add_gridspec(7, 1, height_ratios=height_ratios, hspace=0.60,
                            left=MOBILE_LEFT, right=MOBILE_RIGHT, top=MOBILE_TOP, bottom=MOBILE_BOTTOM)
 
     draw_section_dividers(fig, gs)
@@ -1595,6 +1780,8 @@ def build_mobile_dashboard_figure(summary, report_date, output_png):
 
     fig.text(0.5, 0.015, f'Generated {datetime.now().strftime("%d-%b-%Y %H:%M")}  \u2022  ProductionLink Team, TAM OIL',
               fontsize=10.5, color=SLATE, ha='center', style='italic')
+
+    draw_motor_temp_bar_mobile(fig, gs[6], summary['temp_df'])
 
     plt.savefig(output_png, dpi=200, facecolor='white', bbox_inches='tight')
     plt.close(fig)
