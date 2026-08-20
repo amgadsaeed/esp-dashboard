@@ -44,6 +44,9 @@ PIP_RISE_THRESHOLD_PSI = 15   # sustained PIP increasing-trend threshold
 IMPLAUSIBLE_TEMP_F = 50.0     # downhole temp reading below this = comm/scan glitch, not real
 PIP_BASELINE_WINDOW = pd.Timedelta(minutes=60)  # window used to establish start/end PIP levels
 VX_ACTIVE_THRESHOLD_G = 0.1   # fallback: Vx must be CHANGING and exceed this to count as active
+VX_DOUBLE_RATIO = 2.0           # flag if current Vx is >= 2x its baseline
+VX_DOUBLE_MIN_BASELINE_G = 0.05 # baseline must be at least this to avoid dividing by near-zero noise
+VX_DOUBLE_BASELINE_WINDOW = pd.Timedelta(minutes=60)  # window used for start/7AM Vx levels, same idea as PIP_BASELINE_WINDOW
 
 COL_TIMESTAMP = 'Timestamp'
 COL_STATUS_MOTOR = 'Status-Motor[-]'
@@ -454,40 +457,75 @@ def find_shutdown_events(df, well_name, file_end_time):
 
 def find_vx_alerts(df, well_name, shutdown_starts):
     """
-    Flags wells with Vib-Pump X readings above VX_THRESHOLD_G.
+    Flags a well two ways (either one is enough to include it):
 
-    Sensor spikes at/above VX_GLITCH_CHECK_G (e.g. 5.5G) are treated as
-    glitches - and excluded - unless a real shutdown started within a window
-    around that spike. A high reading that never actually tripped the well
-    is noise, not a genuine vibration event.
+      1. EXISTING CONCEPT: any Vib-Pump X reading above VX_THRESHOLD_G.
+         Sensor spikes at/above VX_GLITCH_CHECK_G (e.g. 5.5G) are treated as
+         glitches - and excluded - unless a real shutdown started within a
+         window around that spike. A high reading that never actually
+         tripped the well is noise, not a genuine vibration event.
+
+      2. NEW CONCEPT: vibration that has sustained-doubled (or more) from
+         its baseline level, AND is still at/above double that baseline at
+         the end of the reporting period (i.e. still doubled by 7 AM).
+         Baseline = median Vx over the first VX_DOUBLE_BASELINE_WINDOW of
+         the day; current level = median Vx over the last
+         VX_DOUBLE_BASELINE_WINDOW (mirrors find_pip_trend's approach, so a
+         one-off spike doesn't get mistaken for a sustained doubling). This
+         catches a well trending toward failure even if it never crosses
+         the absolute VX_THRESHOLD_G ceiling.
     """
-    vx = get_col(df, COL_VX)
-    mask = vx > VX_THRESHOLD_G
-    if not mask.any():
+    vx_raw = get_col(df, COL_VX)
+
+    # ---- concept 1: existing absolute-threshold alert ----
+    mask = vx_raw > VX_THRESHOLD_G
+    sub_valid = pd.DataFrame(columns=[COL_TIMESTAMP, 'Vx'])
+    if mask.any():
+        sub = df.loc[mask, [COL_TIMESTAMP]].copy()
+        sub['Vx'] = vx_raw[mask]
+
+        def is_glitch(ts, val):
+            if val < VX_GLITCH_CHECK_G:
+                return False
+            window_start = ts - VX_GLITCH_WINDOW_BACK
+            window_end = ts + VX_GLITCH_WINDOW_FWD
+            return not any(window_start <= s <= window_end for s in shutdown_starts)
+
+        sub['is_glitch'] = [is_glitch(t, v) for t, v in zip(sub[COL_TIMESTAMP], sub['Vx'])]
+        sub_valid = sub[~sub['is_glitch']]
+    threshold_hit = not sub_valid.empty
+
+    # ---- concept 2: NEW - sustained doubling, still doubled at 7 AM ----
+    vx_valid = vx_raw[vx_raw.notna() & (vx_raw > 0)]
+    ts = df.loc[vx_valid.index, COL_TIMESTAMP]
+    baseline = current_level = None
+    doubling_hit = False
+    if len(vx_valid) >= 4:
+        baseline_mask = ts <= (ts.iloc[0] + VX_DOUBLE_BASELINE_WINDOW)
+        final_mask = ts >= (ts.iloc[-1] - VX_DOUBLE_BASELINE_WINDOW)
+        baseline = vx_valid[baseline_mask].median()
+        current_level = vx_valid[final_mask].median()
+        if pd.notna(baseline) and baseline >= VX_DOUBLE_MIN_BASELINE_G and pd.notna(current_level):
+            doubling_hit = current_level >= VX_DOUBLE_RATIO * baseline
+
+    if not threshold_hit and not doubling_hit:
         return None
 
-    sub = df.loc[mask, [COL_TIMESTAMP]].copy()
-    sub['Vx'] = vx[mask]
+    if threshold_hit:
+        max_row = sub_valid.loc[sub_valid['Vx'].idxmax()]
+        max_vx, max_time, n_over = round(float(max_row['Vx']), 3), max_row[COL_TIMESTAMP], int(len(sub_valid))
+    else:
+        max_idx = vx_valid.idxmax()
+        max_vx, max_time, n_over = round(float(vx_valid.max()), 3), df.loc[max_idx, COL_TIMESTAMP], 0
 
-    def is_glitch(ts, val):
-        if val < VX_GLITCH_CHECK_G:
-            return False
-        window_start = ts - VX_GLITCH_WINDOW_BACK
-        window_end = ts + VX_GLITCH_WINDOW_FWD
-        return not any(window_start <= s <= window_end for s in shutdown_starts)
-
-    sub['is_glitch'] = [is_glitch(t, v) for t, v in zip(sub[COL_TIMESTAMP], sub['Vx'])]
-    sub_valid = sub[~sub['is_glitch']]
-
-    if sub_valid.empty:
-        return None
-
-    max_row = sub_valid.loc[sub_valid['Vx'].idxmax()]
     return {
         'Well': well_name,
-        'Max Vx (G)': round(float(max_row['Vx']), 3),
-        'Time of Max': max_row[COL_TIMESTAMP],
-        'Readings > 2G': int(len(sub_valid)),
+        'Max Vx (G)': max_vx,
+        'Time of Max': max_time,
+        'Readings > 2G': n_over,
+        'Doubled & Still Doubled at 7AM': 'Yes' if doubling_hit else 'No',
+        'Baseline Vx (G)': round(float(baseline), 3) if pd.notna(baseline) else None,
+        'Current Vx (G)': round(float(current_level), 3) if pd.notna(current_level) else None,
     }
 
 
@@ -1086,10 +1124,10 @@ def build_dashboard_figure(summary, report_date, output_png):
 
     draw_table(
         fig, gs[3, 0], summary['vx_df'],
-        columns=['Well', 'Max Vx (G)', 'Readings > 2G', 'Time of Max'],
-        title=f'High Vibration Alerts (Vx > {VX_THRESHOLD_G}G)',
-        accent=LIGHT_GREEN, empty_msg=f'No wells exceeded {VX_THRESHOLD_G}G on the X-axis.',
-        max_rows=12, col_widths=[0.26, 0.22, 0.22, 0.30],
+        columns=['Well', 'Max Vx (G)', 'Readings > 2G', 'Time of Max', 'Doubled & Still Doubled at 7AM'],
+        title=f'High Vibration Alerts (Vx > {VX_THRESHOLD_G}G or doubled & still doubled at 7AM)',
+        accent=LIGHT_GREEN, empty_msg=f'No wells exceeded {VX_THRESHOLD_G}G or showed a sustained doubling.',
+        max_rows=12, col_widths=[0.22, 0.16, 0.16, 0.22, 0.24],
     )
 
     pip_df = summary['pip_df']
@@ -1116,7 +1154,8 @@ def export_excel(summary, results, output_xlsx):
             columns=['Well', 'Reason', 'Shutdown Start', 'Shutdown End', 'Downtime (hrs)', 'Ongoing']
         )).to_excel(writer, sheet_name='Shutdown Events', index=False)
         (summary['vx_df'] if not summary['vx_df'].empty else pd.DataFrame(
-            columns=['Well', 'Max Vx (G)', 'Time of Max', 'Readings > 2G']
+            columns=['Well', 'Max Vx (G)', 'Time of Max', 'Readings > 2G',
+                     'Doubled & Still Doubled at 7AM', 'Baseline Vx (G)', 'Current Vx (G)']
         )).to_excel(writer, sheet_name='High Vibration (Vx gt 2G)', index=False)
         (summary['pip_df'] if not summary['pip_df'].empty else pd.DataFrame(
             columns=['Well', 'PIP-Yesterday 7AM (psi)', 'PIP-Today 7AM (psi)', 'Net Rise (psi)',
@@ -1178,7 +1217,7 @@ def build_whatsapp_message(summary, report_date):
         wells_str = ", ".join(map(str, stopped_wells))
         msg.append(f"\n*Stopped Wells* ({stopped}): {wells_str}")
     else:
-        msg.append("\n*Stopped Wells*: None recorded")
+        msg.append("\nStopped Wells: None recorded")
 
     # Miscommunication Wells Detailed Section
     if miscomm > 0:
@@ -1199,11 +1238,12 @@ def build_whatsapp_message(summary, report_date):
 
     # Vibration Alerts Section
     if not vx_df.empty:
-        msg.append(f"\n*Vibration Alerts* > {VX_THRESHOLD_G}G ({len(vx_df)} wells):")
+        msg.append(f"\n*Vibration Alerts* > {VX_THRESHOLD_G}G or doubled & still doubled at 7AM ({len(vx_df)} wells):")
         for _, row in vx_df.head(5).iterrows():
-            msg.append(f"   • {row['Well']}: Max {row['Max Vx (G)']} G")
+            flag = " \u26A0\uFE0F doubled & still doubled at 7AM" if row.get('Doubled & Still Doubled at 7AM') == 'Yes' else ""
+            msg.append(f"   • {row['Well']}: Max {row['Max Vx (G)']} G{flag}")
     else:
-        msg.append(f"\n*Vibration Alerts:* None > {VX_THRESHOLD_G}G")
+        msg.append(f"\n*Vibration Alerts:* None > {VX_THRESHOLD_G}G, none doubled & still doubled at 7AM")
 
     # Rising PIP Section
     if not pip_df.empty:
@@ -1212,6 +1252,12 @@ def build_whatsapp_message(summary, report_date):
             msg.append(f"   • {row['Well']}: +{row['Net Rise (psi)']} psi")
     else:
         msg.append("\nRising PIP Trends: None flagged")
+
+    # Footer
+    msg.extend([
+        "----------------------------------------",
+        "_Dashboard PNG, Detail Excel Workbook, and text log attached below._"
+    ])
     
     return "\n".join(msg)
 
@@ -1452,7 +1498,7 @@ def draw_reason_pie_mobile(fig, gs_cell, reason_counts, max_slices=8):
 
     wedges, _, autotexts = ax.pie(
         counts.values, colors=colors, autopct=lambda p: f'{p:.0f}%' if p >= 4 else '',
-        startangle=90, pctdistance=0.6, radius=1.5,
+        startangle=90, pctdistance=0.78, radius=1.35,
         wedgeprops=dict(edgecolor='white', linewidth=1.5),
         textprops=dict(color='white', fontweight='bold', fontsize=13),
     )
@@ -1531,10 +1577,10 @@ def build_mobile_dashboard_figure(summary, report_date, output_png):
 
     draw_table_mobile(
         fig, gs[4], summary['vx_df'],
-        columns=['Well', 'Max Vx (G)', 'Readings > 2G', 'Time of Max'],
-        title=f'High Vibration Alerts (Vx > {VX_THRESHOLD_G}G)',
-        accent=LIGHT_GREEN, empty_msg=f'No wells exceeded {VX_THRESHOLD_G}G on the X-axis.',
-        max_rows=12, col_widths=[0.27, 0.24, 0.24, 0.25],
+        columns=['Well', 'Max Vx (G)', 'Time of Max', 'Doubled & Still Doubled at 7AM'],
+        title=f'High Vibration Alerts (Vx > {VX_THRESHOLD_G}G or doubled at 7AM)',
+        accent=LIGHT_GREEN, empty_msg=f'No wells exceeded {VX_THRESHOLD_G}G or showed a sustained doubling.',
+        max_rows=12, col_widths=[0.24, 0.20, 0.24, 0.32],
     )
 
     pip_df = summary['pip_df']
